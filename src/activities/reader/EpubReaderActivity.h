@@ -38,6 +38,12 @@ class EpubReaderActivity final : public Activity {
   // Consumed in onExit() to relocate the finished book into /Read/.
   bool pendingReadFolderMove = false;
 
+  // Per-spine page counts for book-wide page numbering. Allocated on first render.
+  // Entry is 0 for sections not yet indexed. Persisted in page_index.bin.
+  std::unique_ptr<uint16_t[]> sectionPageCounts;
+  uint16_t sectionPageCountsSize = 0;
+  bool pageIndexDirty = false;
+
   // Footnote support
   std::vector<FootnoteEntry> currentPageFootnotes;
   struct SavedPosition {
@@ -52,6 +58,8 @@ class EpubReaderActivity final : public Activity {
                       int orientedMarginBottom, int orientedMarginLeft);
   void renderStatusBar() const;
   void silentIndexNextChapterIfNeeded(uint16_t viewportWidth, uint16_t viewportHeight);
+  // Record a section's page count in the in-memory index and mark it dirty for save.
+  void recordSectionPageCount(int spineIndex, uint16_t count);
   bool saveProgress(int spineIndex, int currentPage, int pageCount);
   // Jump to a percentage of the book (0-100), mapping it to spine and page.
   void jumpToPercent(int percent);

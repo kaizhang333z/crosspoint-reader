@@ -132,7 +132,51 @@ bool Section::loadSectionFile(const int fontId, const float lineCompression, con
   return true;
 }
 
-// Your updated class method (assuming you are using the 'SD' object, which is a wrapper for a specific filesystem)
+uint16_t Section::readPageCountIfValid(const int fontId, const float lineCompression,
+                                       const bool extraParagraphSpacing, const uint8_t paragraphAlignment,
+                                       const uint16_t viewportWidth, const uint16_t viewportHeight,
+                                       const bool hyphenationEnabled, const bool embeddedStyle,
+                                       const uint8_t imageRendering, const bool focusReadingEnabled) const {
+  FsFile f;
+  if (!Storage.openFileForRead("SCT", filePath, f)) return 0;
+
+  uint8_t version;
+  serialization::readPod(f, version);
+  if (version != SECTION_FILE_VERSION) return 0;
+
+  int fileFontId;
+  float fileLineCompression;
+  bool fileExtraParagraphSpacing;
+  uint8_t fileParagraphAlignment;
+  uint16_t fileViewportWidth, fileViewportHeight;
+  bool fileHyphenationEnabled;
+  bool fileEmbeddedStyle;
+  uint8_t fileImageRendering;
+  bool fileFocusReadingEnabled;
+  serialization::readPod(f, fileFontId);
+  serialization::readPod(f, fileLineCompression);
+  serialization::readPod(f, fileExtraParagraphSpacing);
+  serialization::readPod(f, fileParagraphAlignment);
+  serialization::readPod(f, fileViewportWidth);
+  serialization::readPod(f, fileViewportHeight);
+  serialization::readPod(f, fileHyphenationEnabled);
+  serialization::readPod(f, fileEmbeddedStyle);
+  serialization::readPod(f, fileImageRendering);
+  serialization::readPod(f, fileFocusReadingEnabled);
+
+  if (fontId != fileFontId || lineCompression != fileLineCompression ||
+      extraParagraphSpacing != fileExtraParagraphSpacing || paragraphAlignment != fileParagraphAlignment ||
+      viewportWidth != fileViewportWidth || viewportHeight != fileViewportHeight ||
+      hyphenationEnabled != fileHyphenationEnabled || embeddedStyle != fileEmbeddedStyle ||
+      imageRendering != fileImageRendering || focusReadingEnabled != fileFocusReadingEnabled) {
+    return 0;
+  }
+
+  uint16_t count = 0;
+  serialization::readPod(f, count);
+  return count;
+}
+
 bool Section::clearCache() const {
   if (!Storage.exists(filePath.c_str())) {
     LOG_DBG("SCT", "Cache does not exist, no action needed");

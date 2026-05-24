@@ -5,6 +5,7 @@
 #include <FontCacheManager.h>
 #include <FsHelpers.h>
 #include <GfxRenderer.h>
+#include <Memory.h>
 #include <HalStorage.h>
 #include <I18n.h>
 #include <Logging.h>
@@ -701,6 +702,39 @@ void EpubReaderActivity::render(RenderLock&& lock) {
   const uint16_t viewportWidth = renderer.getScreenWidth() - orientedMarginLeft - orientedMarginRight;
   const uint16_t viewportHeight = renderer.getScreenHeight() - orientedMarginTop - orientedMarginBottom;
 
+  // Initialize page index on first render (viewport dimensions are required for the settings fingerprint).
+  if (!sectionPageCounts) {
+    const int spineCount = epub->getSpineItemsCount();
+    if (spineCount > 0) {
+      sectionPageCounts = makeUniqueNoThrow<uint16_t[]>(spineCount);
+      if (sectionPageCounts) {
+        sectionPageCountsSize = static_cast<uint16_t>(spineCount);
+        memset(sectionPageCounts.get(), 0, spineCount * sizeof(uint16_t));
+        if (!EpubReaderUtils::loadPageIndex(*epub, sectionPageCounts.get(), sectionPageCountsSize,
+                                            SETTINGS.getReaderFontId(), SETTINGS.getReaderLineCompression(),
+                                            SETTINGS.extraParagraphSpacing, SETTINGS.paragraphAlignment,
+                                            viewportWidth, viewportHeight, SETTINGS.hyphenationEnabled,
+                                            SETTINGS.embeddedStyle, SETTINGS.imageRendering,
+                                            SETTINGS.focusReadingEnabled)) {
+          // Fast path failed — scan existing section cache files to populate what we already have.
+          for (int i = 0; i < spineCount; i++) {
+            Section sec(epub, i, renderer);
+            const uint16_t count = sec.readPageCountIfValid(
+                SETTINGS.getReaderFontId(), SETTINGS.getReaderLineCompression(), SETTINGS.extraParagraphSpacing,
+                SETTINGS.paragraphAlignment, viewportWidth, viewportHeight, SETTINGS.hyphenationEnabled,
+                SETTINGS.embeddedStyle, SETTINGS.imageRendering, SETTINGS.focusReadingEnabled);
+            if (count > 0) {
+              sectionPageCounts[i] = count;
+              pageIndexDirty = true;
+            }
+          }
+        }
+      } else {
+        LOG_ERR("ERS", "OOM: page index array (%d entries)", spineCount);
+      }
+    }
+  }
+
   if (!section) {
     const auto filepath = epub->getSpineItem(currentSpineIndex).href;
     LOG_DBG("ERS", "Loading file: %s, index: %d", filepath.c_str(), currentSpineIndex);
@@ -820,7 +854,16 @@ void EpubReaderActivity::render(RenderLock&& lock) {
     renderContents(std::move(p), orientedMarginTop, orientedMarginRight, orientedMarginBottom, orientedMarginLeft);
     LOG_DBG("ERS", "Rendered page in %dms", millis() - start);
   }
+  recordSectionPageCount(currentSpineIndex, section->pageCount);
   silentIndexNextChapterIfNeeded(viewportWidth, viewportHeight);
+  if (pageIndexDirty && sectionPageCounts) {
+    EpubReaderUtils::savePageIndex(*epub, sectionPageCounts.get(), sectionPageCountsSize,
+                                   SETTINGS.getReaderFontId(), SETTINGS.getReaderLineCompression(),
+                                   SETTINGS.extraParagraphSpacing, SETTINGS.paragraphAlignment, viewportWidth,
+                                   viewportHeight, SETTINGS.hyphenationEnabled, SETTINGS.embeddedStyle,
+                                   SETTINGS.imageRendering, SETTINGS.focusReadingEnabled);
+    pageIndexDirty = false;
+  }
   saveProgress(currentSpineIndex, section->currentPage, section->pageCount);
 
   showPendingSyncSaveError();
@@ -836,35 +879,71 @@ void EpubReaderActivity::silentIndexNextChapterIfNeeded(const uint16_t viewportW
     return;
   }
 
-  // Build the next chapter cache while the penultimate page is on screen.
+  // Only run on the penultimate page — gives time to index before the chapter turn.
   if (section->currentPage != section->pageCount - 2) {
     return;
   }
 
+  const int spineCount = epub->getSpineItemsCount();
+
+  // First priority: ensure the immediately next chapter is cached.
   const int nextSpineIndex = currentSpineIndex + 1;
-  if (nextSpineIndex < 0 || nextSpineIndex >= epub->getSpineItemsCount()) {
-    return;
+  if (nextSpineIndex >= 0 && nextSpineIndex < spineCount) {
+    Section nextSection(epub, nextSpineIndex, renderer);
+    if (nextSection.loadSectionFile(SETTINGS.getReaderFontId(), SETTINGS.getReaderLineCompression(),
+                                    SETTINGS.extraParagraphSpacing, SETTINGS.paragraphAlignment, viewportWidth,
+                                    viewportHeight, SETTINGS.hyphenationEnabled, SETTINGS.embeddedStyle,
+                                    SETTINGS.imageRendering, SETTINGS.focusReadingEnabled)) {
+      // Next chapter already cached — capture its page count in case we missed it.
+      recordSectionPageCount(nextSpineIndex, nextSection.pageCount);
+    } else {
+      LOG_DBG("ERS", "Silently indexing next chapter: %d", nextSpineIndex);
+      if (!nextSection.createSectionFile(SETTINGS.getReaderFontId(), SETTINGS.getReaderLineCompression(),
+                                         SETTINGS.extraParagraphSpacing, SETTINGS.paragraphAlignment, viewportWidth,
+                                         viewportHeight, SETTINGS.hyphenationEnabled, SETTINGS.embeddedStyle,
+                                         SETTINGS.imageRendering, SETTINGS.focusReadingEnabled)) {
+        LOG_ERR("ERS", "Failed silent indexing for chapter: %d", nextSpineIndex);
+      } else {
+        recordSectionPageCount(nextSpineIndex, nextSection.pageCount);
+      }
+      return;  // One chapter per call — don't also index a second one.
+    }
   }
 
-  Section nextSection(epub, nextSpineIndex, renderer);
-  if (nextSection.loadSectionFile(SETTINGS.getReaderFontId(), SETTINGS.getReaderLineCompression(),
-                                  SETTINGS.extraParagraphSpacing, SETTINGS.paragraphAlignment, viewportWidth,
-                                  viewportHeight, SETTINGS.hyphenationEnabled, SETTINGS.embeddedStyle,
-                                  SETTINGS.imageRendering, SETTINGS.focusReadingEnabled)) {
-    return;
-  }
-
-  LOG_DBG("ERS", "Silently indexing next chapter: %d", nextSpineIndex);
-  if (!nextSection.createSectionFile(SETTINGS.getReaderFontId(), SETTINGS.getReaderLineCompression(),
+  // Second priority: progressively index any remaining uncached chapter so the total
+  // page count fills in over time. Find the first one with an unknown page count.
+  if (!sectionPageCounts) return;
+  for (int i = 0; i < spineCount; i++) {
+    if (sectionPageCounts[i] != 0) continue;
+    LOG_DBG("ERS", "Silently indexing uncached chapter: %d", i);
+    Section sec(epub, i, renderer);
+    if (sec.loadSectionFile(SETTINGS.getReaderFontId(), SETTINGS.getReaderLineCompression(),
+                            SETTINGS.extraParagraphSpacing, SETTINGS.paragraphAlignment, viewportWidth,
+                            viewportHeight, SETTINGS.hyphenationEnabled, SETTINGS.embeddedStyle,
+                            SETTINGS.imageRendering, SETTINGS.focusReadingEnabled)) {
+      recordSectionPageCount(i, sec.pageCount);
+    } else if (sec.createSectionFile(SETTINGS.getReaderFontId(), SETTINGS.getReaderLineCompression(),
                                      SETTINGS.extraParagraphSpacing, SETTINGS.paragraphAlignment, viewportWidth,
                                      viewportHeight, SETTINGS.hyphenationEnabled, SETTINGS.embeddedStyle,
                                      SETTINGS.imageRendering, SETTINGS.focusReadingEnabled)) {
-    LOG_ERR("ERS", "Failed silent indexing for chapter: %d", nextSpineIndex);
+      recordSectionPageCount(i, sec.pageCount);
+    } else {
+      LOG_ERR("ERS", "Failed silent indexing for chapter: %d", i);
+    }
+    return;  // One chapter per call.
   }
 }
 
 bool EpubReaderActivity::saveProgress(int spineIndex, int currentPage, int pageCount) {
   return EpubReaderUtils::saveProgress(*epub, spineIndex, currentPage, pageCount);
+}
+
+void EpubReaderActivity::recordSectionPageCount(const int spineIndex, const uint16_t count) {
+  if (!sectionPageCounts || spineIndex < 0 || spineIndex >= sectionPageCountsSize || count == 0) return;
+  if (sectionPageCounts[spineIndex] != count) {
+    sectionPageCounts[spineIndex] = count;
+    pageIndexDirty = true;
+  }
 }
 void EpubReaderActivity::renderContents(std::unique_ptr<Page> page, const int orientedMarginTop,
                                         const int orientedMarginRight, const int orientedMarginBottom,
@@ -958,10 +1037,30 @@ void EpubReaderActivity::renderContents(std::unique_ptr<Page> page, const int or
 
 void EpubReaderActivity::renderStatusBar() const {
   // Calculate progress in book
-  const int currentPage = section->currentPage + 1;
-  const float pageCount = section->pageCount;
+  int currentPage = section->currentPage + 1;
+  int pageCount = section->pageCount;
   const float sectionChapterProg = (pageCount > 0) ? (static_cast<float>(currentPage) / pageCount) : 0;
   const float bookProgress = epub->calculateProgress(currentSpineIndex, sectionChapterProg) * 100;
+
+  // When book page count is enabled, replace chapter X/Y with book-global X/Y.
+  // Falls back to chapter X/Y if any section is not yet indexed.
+  if (SETTINGS.statusBarBookPageCount && sectionPageCounts && sectionPageCountsSize > 0) {
+    int globalCurrent = section->currentPage + 1;
+    int globalTotal = 0;
+    bool allKnown = true;
+    for (int i = 0; i < sectionPageCountsSize; i++) {
+      if (sectionPageCounts[i] == 0) {
+        allKnown = false;
+        break;
+      }
+      if (i < currentSpineIndex) globalCurrent += sectionPageCounts[i];
+      globalTotal += sectionPageCounts[i];
+    }
+    if (allKnown) {
+      currentPage = globalCurrent;
+      pageCount = globalTotal;
+    }
+  }
 
   std::string title;
 

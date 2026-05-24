@@ -52,4 +52,12 @@ class Section {
 
   // Look up the synthetic paragraph index for the given rendered page.
   std::optional<uint16_t> getParagraphIndexForPage(uint16_t page) const;
+
+  // Read the cached page count for this section without loading it for rendering.
+  // Returns 0 if the cache file does not exist, the version is wrong, or the rendering
+  // parameters do not match current settings. Does NOT delete the cache on mismatch.
+  uint16_t readPageCountIfValid(int fontId, float lineCompression, bool extraParagraphSpacing,
+                                uint8_t paragraphAlignment, uint16_t viewportWidth, uint16_t viewportHeight,
+                                bool hyphenationEnabled, bool embeddedStyle, uint8_t imageRendering,
+                                bool focusReadingEnabled) const;
 };
