@@ -44,7 +44,6 @@ class EpubReaderActivity final : public Activity {
   std::unique_ptr<uint16_t[]> sectionPageCounts;
   uint16_t sectionPageCountsSize = 0;
   bool pageIndexDirty = false;
-  int pageIndexScanIndex = 0;  // Next chapter to check in the per-render passive scan
 
   // Footnote support
   std::vector<FootnoteEntry> currentPageFootnotes;

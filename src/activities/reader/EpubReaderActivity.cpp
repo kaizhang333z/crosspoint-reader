@@ -728,6 +728,46 @@ void EpubReaderActivity::render(RenderLock&& lock) {
               pageIndexDirty = true;
             }
           }
+
+          // Force-index any remaining uncached chapters so book-global page count works
+          // immediately on first open. Subsequent opens take the fast path via page_index.bin.
+          int uncachedTotal = 0;
+          for (int i = 0; i < spineCount; i++) {
+            if (sectionPageCounts[i] == 0) uncachedTotal++;
+          }
+          if (uncachedTotal > 0) {
+            int indexedSoFar = 0;
+            for (int i = 0; i < spineCount; i++) {
+              if (sectionPageCounts[i] != 0) continue;
+              indexedSoFar++;
+              char popupBuf[64];
+              snprintf(popupBuf, sizeof(popupBuf), "%s %d/%d", tr(STR_INDEXING_BOOK), indexedSoFar, uncachedTotal);
+              GUI.drawPopup(renderer, popupBuf);
+              const std::string popupText(popupBuf);
+              const std::function<void()> popupFn = [this, popupText]() {
+                GUI.drawPopup(renderer, popupText.c_str());
+              };
+              Section sec(epub, i, renderer);
+              if (sec.createSectionFile(SETTINGS.getReaderFontId(), SETTINGS.getReaderLineCompression(),
+                                        SETTINGS.extraParagraphSpacing, SETTINGS.paragraphAlignment, viewportWidth,
+                                        viewportHeight, SETTINGS.hyphenationEnabled, SETTINGS.embeddedStyle,
+                                        SETTINGS.imageRendering, SETTINGS.focusReadingEnabled, popupFn)) {
+                recordSectionPageCount(i, sec.pageCount);
+              } else {
+                LOG_ERR("ERS", "Failed to force-index chapter %d", i);
+              }
+            }
+          }
+
+          // Save the populated index now so subsequent opens take the fast path.
+          if (pageIndexDirty) {
+            EpubReaderUtils::savePageIndex(*epub, sectionPageCounts.get(), sectionPageCountsSize,
+                                           SETTINGS.getReaderFontId(), SETTINGS.getReaderLineCompression(),
+                                           SETTINGS.extraParagraphSpacing, SETTINGS.paragraphAlignment, viewportWidth,
+                                           viewportHeight, SETTINGS.hyphenationEnabled, SETTINGS.embeddedStyle,
+                                           SETTINGS.imageRendering, SETTINGS.focusReadingEnabled);
+            pageIndexDirty = false;
+          }
         }
       } else {
         LOG_ERR("ERS", "OOM: page index array (%d entries)", spineCount);
@@ -875,47 +915,33 @@ void EpubReaderActivity::render(RenderLock&& lock) {
 }
 
 void EpubReaderActivity::silentIndexNextChapterIfNeeded(const uint16_t viewportWidth, const uint16_t viewportHeight) {
-  if (!epub || !section) return;
+  if (!epub || !section || section->pageCount < 2) return;
+
+  // Only run on the penultimate page — gives time to cache the next chapter before the user
+  // navigates to it, so chapter transitions feel instant.
+  if (section->currentPage != section->pageCount - 2) return;
 
   const int spineCount = epub->getSpineItemsCount();
+  const int nextSpineIndex = currentSpineIndex + 1;
+  if (nextSpineIndex < 0 || nextSpineIndex >= spineCount) return;
 
-  // First priority: ensure the immediately next chapter is cached (penultimate page only).
-  if (section->pageCount >= 2 && section->currentPage == section->pageCount - 2) {
-    const int nextSpineIndex = currentSpineIndex + 1;
-    if (nextSpineIndex >= 0 && nextSpineIndex < spineCount) {
-      Section nextSection(epub, nextSpineIndex, renderer);
-      if (nextSection.loadSectionFile(SETTINGS.getReaderFontId(), SETTINGS.getReaderLineCompression(),
-                                      SETTINGS.extraParagraphSpacing, SETTINGS.paragraphAlignment, viewportWidth,
-                                      viewportHeight, SETTINGS.hyphenationEnabled, SETTINGS.embeddedStyle,
-                                      SETTINGS.imageRendering, SETTINGS.focusReadingEnabled)) {
-        recordSectionPageCount(nextSpineIndex, nextSection.pageCount);
-      } else {
-        LOG_DBG("ERS", "Silently indexing next chapter: %d", nextSpineIndex);
-        if (!nextSection.createSectionFile(SETTINGS.getReaderFontId(), SETTINGS.getReaderLineCompression(),
-                                           SETTINGS.extraParagraphSpacing, SETTINGS.paragraphAlignment, viewportWidth,
-                                           viewportHeight, SETTINGS.hyphenationEnabled, SETTINGS.embeddedStyle,
-                                           SETTINGS.imageRendering, SETTINGS.focusReadingEnabled)) {
-          LOG_ERR("ERS", "Failed silent indexing for chapter: %d", nextSpineIndex);
-        } else {
-          recordSectionPageCount(nextSpineIndex, nextSection.pageCount);
-        }
-        return;  // Did a blocking createSectionFile — skip second priority this turn.
-      }
-    }
+  Section nextSection(epub, nextSpineIndex, renderer);
+  if (nextSection.loadSectionFile(SETTINGS.getReaderFontId(), SETTINGS.getReaderLineCompression(),
+                                  SETTINGS.extraParagraphSpacing, SETTINGS.paragraphAlignment, viewportWidth,
+                                  viewportHeight, SETTINGS.hyphenationEnabled, SETTINGS.embeddedStyle,
+                                  SETTINGS.imageRendering, SETTINGS.focusReadingEnabled)) {
+    recordSectionPageCount(nextSpineIndex, nextSection.pageCount);
+    return;
   }
 
-  // Second priority: advance a one-per-render passive scan across unchecked chapters.
-  // Uses readPageCountIfValid (fast, read-only) so it never blocks for cache creation.
-  // pageIndexScanIndex advances every call so uncached chapters don't stall the scan.
-  if (!sectionPageCounts || pageIndexScanIndex >= spineCount) return;
-  const int i = pageIndexScanIndex++;
-  if (sectionPageCounts[i] == 0 && i != currentSpineIndex) {
-    Section sec(epub, i, renderer);
-    const uint16_t count = sec.readPageCountIfValid(
-        SETTINGS.getReaderFontId(), SETTINGS.getReaderLineCompression(), SETTINGS.extraParagraphSpacing,
-        SETTINGS.paragraphAlignment, viewportWidth, viewportHeight, SETTINGS.hyphenationEnabled,
-        SETTINGS.embeddedStyle, SETTINGS.imageRendering, SETTINGS.focusReadingEnabled);
-    if (count > 0) recordSectionPageCount(i, count);
+  LOG_DBG("ERS", "Silently indexing next chapter: %d", nextSpineIndex);
+  if (!nextSection.createSectionFile(SETTINGS.getReaderFontId(), SETTINGS.getReaderLineCompression(),
+                                     SETTINGS.extraParagraphSpacing, SETTINGS.paragraphAlignment, viewportWidth,
+                                     viewportHeight, SETTINGS.hyphenationEnabled, SETTINGS.embeddedStyle,
+                                     SETTINGS.imageRendering, SETTINGS.focusReadingEnabled)) {
+    LOG_ERR("ERS", "Failed silent indexing for chapter: %d", nextSpineIndex);
+  } else {
+    recordSectionPageCount(nextSpineIndex, nextSection.pageCount);
   }
 }
 
