@@ -728,46 +728,57 @@ void EpubReaderActivity::render(RenderLock&& lock) {
               pageIndexDirty = true;
             }
           }
+        }
 
-          // Force-index any remaining uncached chapters so book-global page count works
-          // immediately on first open. Subsequent opens take the fast path via page_index.bin.
-          int uncachedTotal = 0;
-          for (int i = 0; i < spineCount; i++) {
-            if (sectionPageCounts[i] == 0) uncachedTotal++;
-          }
-          if (uncachedTotal > 0) {
-            int indexedSoFar = 0;
-            for (int i = 0; i < spineCount; i++) {
-              if (sectionPageCounts[i] != 0) continue;
-              indexedSoFar++;
-              char popupBuf[64];
-              snprintf(popupBuf, sizeof(popupBuf), "%s %d/%d", tr(STR_INDEXING_BOOK), indexedSoFar, uncachedTotal);
-              GUI.drawPopup(renderer, popupBuf);
-              const std::string popupText(popupBuf);
-              const std::function<void()> popupFn = [this, popupText]() {
-                GUI.drawPopup(renderer, popupText.c_str());
-              };
-              Section sec(epub, i, renderer);
-              if (sec.createSectionFile(SETTINGS.getReaderFontId(), SETTINGS.getReaderLineCompression(),
-                                        SETTINGS.extraParagraphSpacing, SETTINGS.paragraphAlignment, viewportWidth,
-                                        viewportHeight, SETTINGS.hyphenationEnabled, SETTINGS.embeddedStyle,
-                                        SETTINGS.imageRendering, SETTINGS.focusReadingEnabled, popupFn)) {
-                recordSectionPageCount(i, sec.pageCount);
-              } else {
-                LOG_ERR("ERS", "Failed to force-index chapter %d", i);
-              }
+        // Force-index any remaining uncached chapters so book-global page count works.
+        // Runs whether the fast load succeeded or not — this lets a cancelled or interrupted
+        // indexing pass resume on the next open instead of restarting from chapter 0.
+        int uncachedTotal = 0;
+        for (int i = 0; i < spineCount; i++) {
+          if (sectionPageCounts[i] == 0) uncachedTotal++;
+        }
+        if (uncachedTotal > 0) {
+          int indexedSoFar = 0;
+          bool cancelled = false;
+          for (int i = 0; i < spineCount && !cancelled; i++) {
+            if (sectionPageCounts[i] != 0) continue;
+            indexedSoFar++;
+            char popupBuf[96];
+            snprintf(popupBuf, sizeof(popupBuf), "%s %d/%d (%s %s)", tr(STR_INDEXING_BOOK), indexedSoFar,
+                     uncachedTotal, tr(STR_BACK), tr(STR_TO_CANCEL));
+            GUI.drawPopup(renderer, popupBuf);
+            const std::string popupText(popupBuf);
+            const std::function<void()> popupFn = [this, popupText]() {
+              GUI.drawPopup(renderer, popupText.c_str());
+            };
+            Section sec(epub, i, renderer);
+            if (sec.createSectionFile(SETTINGS.getReaderFontId(), SETTINGS.getReaderLineCompression(),
+                                      SETTINGS.extraParagraphSpacing, SETTINGS.paragraphAlignment, viewportWidth,
+                                      viewportHeight, SETTINGS.hyphenationEnabled, SETTINGS.embeddedStyle,
+                                      SETTINGS.imageRendering, SETTINGS.focusReadingEnabled, popupFn)) {
+              recordSectionPageCount(i, sec.pageCount);
+            } else {
+              LOG_ERR("ERS", "Failed to force-index chapter %d", i);
+            }
+            // Poll input directly — loop() isn't running while render() is blocked here.
+            // Use wasReleased so we consume the same edge that loop()'s "Back short-release =
+            // onGoHome" check would otherwise fire on, preventing accidental home navigation.
+            gpio.update();
+            if (gpio.wasReleased(HalGPIO::BTN_BACK)) {
+              LOG_DBG("ERS", "Book indexing cancelled by user after %d/%d", indexedSoFar, uncachedTotal);
+              cancelled = true;
             }
           }
+        }
 
-          // Save the populated index now so subsequent opens take the fast path.
-          if (pageIndexDirty) {
-            EpubReaderUtils::savePageIndex(*epub, sectionPageCounts.get(), sectionPageCountsSize,
-                                           SETTINGS.getReaderFontId(), SETTINGS.getReaderLineCompression(),
-                                           SETTINGS.extraParagraphSpacing, SETTINGS.paragraphAlignment, viewportWidth,
-                                           viewportHeight, SETTINGS.hyphenationEnabled, SETTINGS.embeddedStyle,
-                                           SETTINGS.imageRendering, SETTINGS.focusReadingEnabled);
-            pageIndexDirty = false;
-          }
+        // Save whatever we have (full or partial) so subsequent opens pick up where we stopped.
+        if (pageIndexDirty) {
+          EpubReaderUtils::savePageIndex(*epub, sectionPageCounts.get(), sectionPageCountsSize,
+                                         SETTINGS.getReaderFontId(), SETTINGS.getReaderLineCompression(),
+                                         SETTINGS.extraParagraphSpacing, SETTINGS.paragraphAlignment, viewportWidth,
+                                         viewportHeight, SETTINGS.hyphenationEnabled, SETTINGS.embeddedStyle,
+                                         SETTINGS.imageRendering, SETTINGS.focusReadingEnabled);
+          pageIndexDirty = false;
         }
       } else {
         LOG_ERR("ERS", "OOM: page index array (%d entries)", spineCount);
