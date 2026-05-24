@@ -39,10 +39,12 @@ class EpubReaderActivity final : public Activity {
   bool pendingReadFolderMove = false;
 
   // Per-spine page counts for book-wide page numbering. Allocated on first render.
-  // Entry is 0 for sections not yet indexed. Persisted in page_index.bin.
+  // 0 = unchecked, 0xFFFF = checked but empty (0 pages), else actual count.
+  // Persisted in page_index.bin.
   std::unique_ptr<uint16_t[]> sectionPageCounts;
   uint16_t sectionPageCountsSize = 0;
   bool pageIndexDirty = false;
+  int pageIndexScanIndex = 0;  // Next chapter to check in the per-render passive scan
 
   // Footnote support
   std::vector<FootnoteEntry> currentPageFootnotes;

@@ -174,7 +174,8 @@ uint16_t Section::readPageCountIfValid(const int fontId, const float lineCompres
 
   uint16_t count = 0;
   serialization::readPod(f, count);
-  return count;
+  // Return 0xFFFF to distinguish "valid file but 0 pages" from "file missing/stale" (returns 0).
+  return (count == 0) ? static_cast<uint16_t>(0xFFFFu) : count;
 }
 
 bool Section::clearCache() const {
