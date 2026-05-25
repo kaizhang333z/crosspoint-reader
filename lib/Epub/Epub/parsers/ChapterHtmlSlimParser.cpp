@@ -1168,6 +1168,16 @@ bool ChapterHtmlSlimParser::parseAndBuildPages() {
   // Compute the time taken to parse and build pages
   const uint32_t chapterStartTime = millis();
   do {
+    // Cancellation hook. Called once per parse-buffer chunk so cancel latency is bounded
+    // by chunk parse time (well under a second). Caller is responsible for driving any
+    // input-polling needed to detect the cancel signal — this just returns true to abort.
+    if (cancelFn && cancelFn()) {
+      LOG_DBG("EHP", "Parse cancelled by caller");
+      destroyXmlParser(parser);
+      file.close();
+      return false;
+    }
+
     void* const buf = XML_GetBuffer(parser, PARSE_BUFFER_SIZE);
     if (!buf) {
       LOG_ERR("EHP", "Couldn't allocate memory for buffer");

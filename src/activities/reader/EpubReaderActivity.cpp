@@ -740,6 +740,23 @@ void EpubReaderActivity::render(RenderLock&& lock) {
         if (uncachedTotal > 0) {
           int indexedSoFar = 0;
           bool cancelled = false;
+          // cancelFn is invoked once per parse chunk (well under a second). It drives
+          // gpio.update() itself — loop() isn't running while render() blocks here, so
+          // without frequent polling InputManager's debouncer would never observe a stable
+          // press/release transition and wasReleased() would silently miss the edge.
+          // Detect a press while held (not wait for release) so cancel fires as soon as
+          // possible; the release edge that follows is then consumed by an extra update()
+          // after the parser returns, preventing loop() from firing its short-Back =
+          // onGoHome handler. Goes through mappedInput so user front-button remaps are
+          // honored — polling raw HalGPIO::BTN_BACK would watch hardware index 0 only.
+          const std::function<bool()> cancelFn = [this, &cancelled]() {
+            gpio.update();
+            if (mappedInput.isPressed(MappedInputManager::Button::Back)) {
+              cancelled = true;
+              return true;
+            }
+            return false;
+          };
           for (int i = 0; i < spineCount && !cancelled; i++) {
             if (sectionPageCounts[i] != 0) continue;
             indexedSoFar++;
@@ -752,21 +769,28 @@ void EpubReaderActivity::render(RenderLock&& lock) {
               GUI.drawPopup(renderer, popupText.c_str());
             };
             Section sec(epub, i, renderer);
-            if (sec.createSectionFile(SETTINGS.getReaderFontId(), SETTINGS.getReaderLineCompression(),
-                                      SETTINGS.extraParagraphSpacing, SETTINGS.paragraphAlignment, viewportWidth,
-                                      viewportHeight, SETTINGS.hyphenationEnabled, SETTINGS.embeddedStyle,
-                                      SETTINGS.imageRendering, SETTINGS.focusReadingEnabled, popupFn)) {
+            const bool ok = sec.createSectionFile(SETTINGS.getReaderFontId(), SETTINGS.getReaderLineCompression(),
+                                                  SETTINGS.extraParagraphSpacing, SETTINGS.paragraphAlignment,
+                                                  viewportWidth, viewportHeight, SETTINGS.hyphenationEnabled,
+                                                  SETTINGS.embeddedStyle, SETTINGS.imageRendering,
+                                                  SETTINGS.focusReadingEnabled, popupFn, cancelFn);
+            if (ok) {
               recordSectionPageCount(i, sec.pageCount);
+            } else if (cancelled) {
+              LOG_DBG("ERS", "Book indexing cancelled by user after %d/%d", indexedSoFar, uncachedTotal);
             } else {
               LOG_ERR("ERS", "Failed to force-index chapter %d", i);
             }
-            // Poll input directly — loop() isn't running while render() is blocked here.
-            // Use wasReleased so we consume the same edge that loop()'s "Back short-release =
-            // onGoHome" check would otherwise fire on, preventing accidental home navigation.
-            gpio.update();
-            if (gpio.wasReleased(HalGPIO::BTN_BACK)) {
-              LOG_DBG("ERS", "Book indexing cancelled by user after %d/%d", indexedSoFar, uncachedTotal);
-              cancelled = true;
+          }
+          // Drain the trailing release edge so loop()'s short-Back-release = onGoHome
+          // handler doesn't fire immediately after cancel. Poll until release is observed
+          // or we time out (~200ms is plenty for a user lifting their finger).
+          if (cancelled) {
+            const uint32_t pollUntil = millis() + 200;
+            while (millis() < pollUntil) {
+              gpio.update();
+              if (mappedInput.wasReleased(MappedInputManager::Button::Back)) break;
+              delay(10);
             }
           }
         }
